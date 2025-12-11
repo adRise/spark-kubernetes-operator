@@ -1,0 +1,255 @@
+# =============================================================================
+# Spark Connect Server - Production Configuration
+# =============================================================================
+# This SparkApplication runs a Spark Connect gRPC server that allows remote
+# clients to submit Spark jobs. It provides a long-running service with
+# dynamic allocation and auto-restart capabilities.
+#
+# Features:
+# - Delta Lake support with Unity Catalog integration
+# - Dynamic allocation (1-60 executors)
+# - S3 storage with IAM role authentication
+# - PVC-backed local storage for shuffle data
+# - Event logging for History Server
+# - FAIR scheduler mode for multi-tenant workloads
+#
+# Usage:
+#   kubectl apply -f spark-connect-server.yaml -n production-spark
+#
+# Connect via:
+#   spark-connect://spark-connect-server:15002
+# =============================================================================
+
+apiVersion: spark.apache.org/v1
+kind: SparkApplication
+metadata:
+  name: spark-connect-server
+  labels:
+    app: spark-connect
+    environment: production
+spec:
+  # ---------------------------------------------------------------------------
+  # Application Entry Point
+  # ---------------------------------------------------------------------------
+  mainClass: org.apache.spark.sql.connect.service.SparkConnectServer
+  
+  runtimeVersions:
+    sparkVersion: "4.0.1"
+    scalaVersion: "2.13"
+
+  # ---------------------------------------------------------------------------
+  # Application Lifecycle Management
+  # ---------------------------------------------------------------------------
+  applicationTolerations:
+    # Keep resources for 1 hour after failure for debugging
+    resourceRetainPolicy: OnFailure
+    resourceRetainDurationMillis: 3600000
+    
+    # Auto-restart configuration for long-running service
+    restartConfig:
+      restartPolicy: Always
+      maxRestartAttempts: 999999        # Effectively infinite restarts
+      restartBackoffMillis: 30000       # Wait 30s between restarts
+
+  # ---------------------------------------------------------------------------
+  # Driver Pod Template
+  # ---------------------------------------------------------------------------
+  driverSpec:
+    podTemplateSpec:
+      metadata:
+        labels:
+          app: spark-connect
+          component: server
+          environment: production
+      spec:
+        serviceAccountName: spark
+        securityContext:
+          runAsUser: 185
+          runAsNonRoot: true
+          fsGroup: 185
+        containers:
+          - name: spark-kubernetes-driver
+            resources:
+              requests:
+                cpu: "8"
+                memory: 20Gi
+              limits:
+                cpu: "8"
+                memory: 20Gi
+
+  # ---------------------------------------------------------------------------
+  # Executor Pod Template
+  # ---------------------------------------------------------------------------
+  executorSpec:
+    podTemplateSpec:
+      metadata:
+        labels:
+          app: spark-connect
+          component: executor
+      spec:
+        serviceAccountName: spark
+        securityContext:
+          runAsUser: 185
+          runAsNonRoot: true
+          fsGroup: 185
+
+  # ---------------------------------------------------------------------------
+  # Spark Configuration
+  # ---------------------------------------------------------------------------
+  sparkConf:
+    # =========================================================================
+    # Spark Connect Server Settings
+    # =========================================================================
+    spark.connect.grpc.binding.host: "0.0.0.0"
+    spark.connect.grpc.binding.port: "15002"
+    spark.connect.grpc.maxInboundMessageSize: "134217728"  # 128MB
+    spark.connect.session.maxExecutionTime: "24h"
+    spark.connect.session.maxIdleTime: "1h"
+
+    # =========================================================================
+    # Container & Kubernetes Settings
+    # =========================================================================
+    spark.kubernetes.container.image: "apache/spark:4.0.1"
+    spark.kubernetes.container.image.pullPolicy: "IfNotPresent"
+    spark.kubernetes.namespace: "production-spark"
+    spark.kubernetes.authenticate.driver.serviceAccountName: "spark"
+    
+    # IAM Role for AWS Access
+    spark.kubernetes.driver.annotation.iam.amazonaws.com/role: "arn:aws:iam::986748113845:role/flink_scalamigo_access-production"
+    spark.kubernetes.executor.annotation.iam.amazonaws.com/role: "arn:aws:iam::986748113845:role/flink_scalamigo_access-production"
+    
+    # Pod Labels
+    spark.kubernetes.driver.label.app: "spark-connect"
+    spark.kubernetes.driver.label.component: "server"
+    spark.kubernetes.driver.label.environment: "production"
+    spark.kubernetes.executor.label.app: "spark-connect"
+    spark.kubernetes.executor.label.environment: "production"
+    
+    # Environment Variables
+    spark.kubernetes.driverEnv.TUBI_ENVIRONMENT: "production"
+    spark.kubernetes.driverEnv.TUBI_S3_ENVIRONMENT: "production"
+
+    # =========================================================================
+    # Driver & Executor Resources
+    # =========================================================================
+    spark.driver.cores: "8"
+    spark.driver.memory: "32g"
+    spark.driver.memoryOverhead: "4g"
+    spark.executor.cores: "8"
+    spark.executor.memory: "56g"
+
+    # =========================================================================
+    # Dynamic Allocation
+    # =========================================================================
+    spark.dynamicAllocation.enabled: "true"
+    spark.dynamicAllocation.shuffleTracking.enabled: "true"
+    spark.dynamicAllocation.minExecutors: "1"
+    spark.dynamicAllocation.initialExecutors: "2"
+    spark.dynamicAllocation.maxExecutors: "60"
+
+    # =========================================================================
+    # Local Storage (PVC-backed for shuffle data)
+    # =========================================================================
+    spark.local.dir: "/var/data/spark-local"
+    spark.shuffle.sort.io.plugin.class: "org.apache.spark.shuffle.KubernetesLocalDiskShuffleDataIO"
+    
+    # Driver PVC (100GB)
+    spark.kubernetes.driver.volumes.persistentVolumeClaim.spark-local-dir-1.mount.path: "/var/data/spark-local"
+    spark.kubernetes.driver.volumes.persistentVolumeClaim.spark-local-dir-1.mount.readOnly: "false"
+    spark.kubernetes.driver.volumes.persistentVolumeClaim.spark-local-dir-1.options.claimName: "OnDemand"
+    spark.kubernetes.driver.volumes.persistentVolumeClaim.spark-local-dir-1.options.sizeLimit: "100Gi"
+    spark.kubernetes.driver.volumes.persistentVolumeClaim.spark-local-dir-1.options.storageClass: "ebs-gp3-throughput"
+    
+    # Executor PVC (400GB)
+    spark.kubernetes.executor.volumes.persistentVolumeClaim.spark-local-dir-1.mount.path: "/var/data/spark-local"
+    spark.kubernetes.executor.volumes.persistentVolumeClaim.spark-local-dir-1.mount.readOnly: "false"
+    spark.kubernetes.executor.volumes.persistentVolumeClaim.spark-local-dir-1.options.claimName: "OnDemand"
+    spark.kubernetes.executor.volumes.persistentVolumeClaim.spark-local-dir-1.options.sizeLimit: "400Gi"
+    spark.kubernetes.executor.volumes.persistentVolumeClaim.spark-local-dir-1.options.storageClass: "ebs-gp3-throughput"
+
+    # =========================================================================
+    # S3 / Hadoop Configuration
+    # =========================================================================
+    spark.hadoop.fs.s3.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    spark.hadoop.fs.s3a.fast.upload: "true"
+
+    # =========================================================================
+    # Event Logging (for History Server)
+    # =========================================================================
+    spark.eventLog.enabled: "true"
+    spark.eventLog.dir: "s3a://tubi-scalamigo-datalake-production/spark-history/"
+    spark.eventLog.compress: "true"
+    spark.eventLog.overwrite: "true"
+    spark.eventLog.rolling.enabled: "true"
+    spark.eventLog.rolling.maxFileSize: "128m"
+
+    # =========================================================================
+    # External Dependencies
+    # =========================================================================
+    spark.jars.ivy: "/tmp/ivy"
+    spark.jars.packages: "io.delta:delta-spark_2.13:4.0.0,io.unitycatalog:unitycatalog-spark_2.13:0.3.0,org.apache.hadoop:hadoop-aws:3.4.0"
+
+    # =========================================================================
+    # Delta Lake & Catalog Configuration
+    # =========================================================================
+    spark.sql.extensions: "io.delta.sql.DeltaSparkSessionExtension"
+    spark.sql.catalog.spark_catalog: "org.apache.spark.sql.delta.catalog.DeltaCatalog"
+    spark.sql.defaultCatalog: "core_prod"
+    
+    # Delta Lake optimizations
+    spark.databricks.delta.autoCompact.enabled: "true"
+    spark.databricks.delta.optimizeWrite.enabled: "true"
+
+    # Unity Catalog - Core Production
+    # NOTE: Token should be provided via K8s Secret or environment variable
+    spark.sql.catalog.core_prod: "io.unitycatalog.spark.UCSingleCatalog"
+    spark.sql.catalog.core_prod.uri: "https://tubi-production.cloud.databricks.com/api/2.1/unity-catalog"
+    # spark.sql.catalog.core_prod.token: "${DATABRICKS_TOKEN}"  # Set via env var or secret
+    
+    # Unity Catalog - ML Production
+    # NOTE: Token should be provided via K8s Secret or environment variable
+    spark.sql.catalog.ml_prod: "io.unitycatalog.spark.UCSingleCatalog"
+    spark.sql.catalog.ml_prod.uri: "https://tubi-production.cloud.databricks.com/api/2.1/unity-catalog"
+    # spark.sql.catalog.ml_prod.token: "${DATABRICKS_TOKEN}"  # Set via env var or secret
+
+    # =========================================================================
+    # SQL & Adaptive Query Execution
+    # =========================================================================
+    spark.sql.adaptive.enabled: "true"
+    spark.sql.adaptive.coalescePartitions.enabled: "true"
+    spark.sql.adaptive.coalescePartitions.minPartitionNum: "1"
+    spark.sql.shuffle.partitions: "1600"
+    spark.sql.files.maxPartitionBytes: "1073741824"  # 1GB
+    spark.sql.parquet.int96RebaseModeInWrite: "CORRECTED"
+
+    # =========================================================================
+    # Scheduler Configuration
+    # =========================================================================
+    spark.scheduler.mode: "FAIR"
+    spark.scheduler.minRegisteredResourcesRatio: "0.0"
+    spark.scheduler.maxRegisteredResourcesWaitingTime: "10s"
+
+    # =========================================================================
+    # Speculation (for straggler mitigation)
+    # =========================================================================
+    spark.speculation: "true"
+    spark.speculation.interval: "1000ms"
+    spark.speculation.multiplier: "1.5"
+    spark.speculation.quantile: "0.75"
+
+    # =========================================================================
+    # Network & Timeouts
+    # =========================================================================
+    spark.network.timeout: "600s"
+
+    # =========================================================================
+    # Decommission & Graceful Shutdown
+    # =========================================================================
+    spark.decommission.enabled: "true"
+    spark.storage.decommission.enabled: "true"
+    spark.storage.decommission.rddBlocks.enabled: "true"
+    spark.storage.decommission.rddBlocks.timeout: "300s"
+    spark.storage.decommission.shuffleBlocks.enabled: "true"
+    spark.storage.decommission.shuffleBlocks.timeout: "300s"
+

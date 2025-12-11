@@ -1,0 +1,202 @@
+# =============================================================================
+# PySpark S3 + Dependencies Test
+# =============================================================================
+# Tests:
+# 1. Loading Python file from S3
+# 2. spark.submit.pyFiles for additional modules
+# 3. Wheel file distribution via spark.jars
+#
+# Usage:
+#   kubectl apply -f pyspark-s3-test.yaml -n production-spark
+#   kubectl logs -f pyspark-s3-test-0-driver -n production-spark
+# =============================================================================
+
+apiVersion: spark.apache.org/v1
+kind: SparkApplication
+metadata:
+  name: pyspark-s3-test
+  labels:
+    app: pyspark-s3-test
+    type: validation
+spec:
+  # ---------------------------------------------------------------------------
+  # PySpark Entry Point from S3
+  # ---------------------------------------------------------------------------
+  # Load Python script from S3
+  # Note: This tests whether the driver can fetch Python files from S3
+  pyFiles: "s3a://tubi-scalamigo-artifacts/adRise/spark/wrapper.py"
+  
+  # Arguments for wrapper.py (module name to run)
+  # wrapper.py expects: module_name [args...]
+  # For testing, we'll just test if the file loads
+  driverArgs: []
+  
+  runtimeVersions:
+    sparkVersion: "3.5.3"
+    scalaVersion: "2.12"
+
+  # ---------------------------------------------------------------------------
+  # Lifecycle
+  # ---------------------------------------------------------------------------
+  applicationTolerations:
+    resourceRetainPolicy: Always
+    resourceRetainDurationMillis: 3600000
+    restartConfig:
+      restartPolicy: Never
+      maxRestartAttempts: 0
+
+  # ---------------------------------------------------------------------------
+  # Driver Pod Template
+  # ---------------------------------------------------------------------------
+  driverSpec:
+    podTemplateSpec:
+      spec:
+        serviceAccountName: spark
+        containers:
+          - name: spark-kubernetes-driver
+            resources:
+              requests:
+                cpu: "2"
+                memory: 4Gi
+              limits:
+                cpu: "4"
+                memory: 8Gi
+
+  # ---------------------------------------------------------------------------
+  # Spark Configuration
+  # ---------------------------------------------------------------------------
+  sparkConf:
+    # Image with Python + hadoop-aws for S3 access
+    spark.kubernetes.container.image: "public.ecr.aws/dataminded/spark-k8s-glue:v3.5.3-hadoop-3.3.6-v2"
+    spark.kubernetes.container.image.pullPolicy: "IfNotPresent"
+    spark.kubernetes.namespace: "production-spark"
+    spark.kubernetes.authenticate.driver.serviceAccountName: "spark"
+    
+    # IAM Role for S3 access (kiam)
+    spark.kubernetes.driver.annotation.iam.amazonaws.com/role: "arn:aws:iam::986748113845:role/flink_scalamigo_access-production"
+    spark.kubernetes.executor.annotation.iam.amazonaws.com/role: "arn:aws:iam::986748113845:role/flink_scalamigo_access-production"
+    
+    # S3 FileSystem Configuration
+    spark.hadoop.fs.s3.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    spark.hadoop.fs.s3a.aws.credentials.provider: "com.amazonaws.auth.InstanceProfileCredentialsProvider"
+    
+    # Python configuration
+    spark.pyspark.python: "/usr/bin/python3"
+    spark.pyspark.driver.python: "/usr/bin/python3"
+    
+    # ---------------------------------------------------------------------------
+    # WHEEL FILE DISTRIBUTION
+    # ---------------------------------------------------------------------------
+    # Method 1: Use spark.jars to distribute wheel files to executors
+    # The wheel will be added to PYTHONPATH automatically if it ends in .whl
+    # spark.jars: "s3a://tubi-scalamigo-artifacts/adRise/pyspark/spock-1.0.whl"
+    
+    # Method 2: Use spark.submit.pyFiles for additional Python files/packages
+    # These get distributed to all executors
+    # spark.submit.pyFiles: "s3a://path/to/module.zip,s3a://path/to/another.py"
+    
+    # Method 3: Use spark.files for general file distribution
+    # spark.files: "s3a://path/to/config.json"
+    
+    # ---------------------------------------------------------------------------
+    # PIP PACKAGES AT RUNTIME (NOT RECOMMENDED)
+    # ---------------------------------------------------------------------------
+    # Spark doesn't have native pip install support
+    # Options:
+    # 1. Bake packages into the Docker image (RECOMMENDED)
+    # 2. Use init containers to pip install before Spark starts
+    # 3. Use spark.kubernetes.driver.podTemplateFile with init container
+    
+    # Dynamic allocation off for simple test
+    spark.dynamicAllocation.enabled: "false"
+    spark.executor.instances: "1"
+    
+    # Keep driver for debugging
+    spark.kubernetes.driver.deleteOnTermination: "false"
+    
+    # Environment
+    spark.kubernetes.driverEnv.TUBI_ENVIRONMENT: "production"
+
+---
+# =============================================================================
+# Test with Init Container for pip install (Advanced)
+# =============================================================================
+# This demonstrates how to install pip packages at runtime using init containers
+# NOTE: This is slower than baking into image, use only when necessary
+
+apiVersion: spark.apache.org/v1
+kind: SparkApplication
+metadata:
+  name: pyspark-pip-test
+  labels:
+    app: pyspark-pip-test
+    type: validation
+spec:
+  pyFiles: "local:///opt/spark/examples/src/main/python/pi.py"
+  
+  runtimeVersions:
+    sparkVersion: "3.5.3"
+    scalaVersion: "2.12"
+
+  applicationTolerations:
+    resourceRetainPolicy: Always
+    resourceRetainDurationMillis: 3600000
+    restartConfig:
+      restartPolicy: Never
+
+  # ---------------------------------------------------------------------------
+  # Driver Pod Template with Init Container
+  # ---------------------------------------------------------------------------
+  driverSpec:
+    podTemplateSpec:
+      spec:
+        serviceAccountName: spark
+        
+        # Init container to install pip packages
+        initContainers:
+          - name: pip-installer
+            image: "public.ecr.aws/dataminded/spark-k8s-glue:v3.5.3-hadoop-3.3.6-v2"
+            command:
+              - /bin/sh
+              - -c
+              - |
+                # Install packages to shared volume
+                pip install --target=/opt/spark-deps pandas numpy pyarrow
+                echo "Packages installed successfully"
+            volumeMounts:
+              - name: spark-deps
+                mountPath: /opt/spark-deps
+        
+        containers:
+          - name: spark-kubernetes-driver
+            resources:
+              requests:
+                cpu: "2"
+                memory: 4Gi
+              limits:
+                cpu: "4"
+                memory: 8Gi
+            env:
+              # Add installed packages to PYTHONPATH
+              - name: PYTHONPATH
+                value: "/opt/spark-deps:$PYTHONPATH"
+            volumeMounts:
+              - name: spark-deps
+                mountPath: /opt/spark-deps
+        
+        volumes:
+          - name: spark-deps
+            emptyDir: {}
+
+  sparkConf:
+    spark.kubernetes.container.image: "public.ecr.aws/dataminded/spark-k8s-glue:v3.5.3-hadoop-3.3.6-v2"
+    spark.kubernetes.container.image.pullPolicy: "IfNotPresent"
+    spark.kubernetes.namespace: "production-spark"
+    spark.kubernetes.authenticate.driver.serviceAccountName: "spark"
+    spark.kubernetes.driver.annotation.iam.amazonaws.com/role: "arn:aws:iam::986748113845:role/flink_scalamigo_access-production"
+    spark.pyspark.python: "/usr/bin/python3"
+    spark.dynamicAllocation.enabled: "false"
+    spark.executor.instances: "1"
+    spark.kubernetes.driver.deleteOnTermination: "false"
+

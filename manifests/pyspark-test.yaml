@@ -1,0 +1,98 @@
+# =============================================================================
+# PySpark Validation Test Job
+# =============================================================================
+# Tests:
+# 1. Basic PySpark execution
+# 2. S3 access from Python
+# 3. Additional pyFiles distribution
+# 4. Python package availability
+#
+# Usage:
+#   kubectl apply -f pyspark-test.yaml -n production-spark
+#   kubectl logs -f pyspark-test-0-driver -n production-spark
+# =============================================================================
+
+apiVersion: spark.apache.org/v1
+kind: SparkApplication
+metadata:
+  name: pyspark-test
+  labels:
+    app: pyspark-test
+    type: validation
+spec:
+  # ---------------------------------------------------------------------------
+  # PySpark Entry Point
+  # ---------------------------------------------------------------------------
+  # Option 1: local:// - file baked into image (not available in dataminded image)
+  # Option 2: s3a:// - file from S3
+  # For this test, we'll use the wrapper.py from S3 which tests S3 fetch capability
+  pyFiles: "s3a://tubi-scalamigo-artifacts/adRise/spark/wrapper.py"
+  
+  # Arguments: wrapper.py expects module_name as first arg
+  # We'll just test if the Python environment works (will fail with "no module" which is expected)
+  driverArgs: ["__test_python_env__"]
+  
+  runtimeVersions:
+    sparkVersion: "3.5.3"
+    scalaVersion: "2.12"
+
+  # ---------------------------------------------------------------------------
+  # Lifecycle - Keep pods for debugging
+  # ---------------------------------------------------------------------------
+  applicationTolerations:
+    resourceRetainPolicy: Always
+    resourceRetainDurationMillis: 3600000  # 1 hour
+    restartConfig:
+      restartPolicy: Never
+      maxRestartAttempts: 0
+
+  # ---------------------------------------------------------------------------
+  # Driver Pod Template
+  # ---------------------------------------------------------------------------
+  driverSpec:
+    podTemplateSpec:
+      spec:
+        serviceAccountName: spark
+        containers:
+          - name: spark-kubernetes-driver
+            resources:
+              requests:
+                cpu: "1"
+                memory: 2Gi
+              limits:
+                cpu: "2"
+                memory: 4Gi
+
+  # ---------------------------------------------------------------------------
+  # Spark Configuration
+  # ---------------------------------------------------------------------------
+  sparkConf:
+    # Use dataminded image which has Python + hadoop-aws pre-installed
+    # Note: Official apache/spark:3.5.3 does NOT include Python!
+    # Available options with Python:
+    #   - public.ecr.aws/dataminded/spark-k8s-glue:v3.5.3-hadoop-3.3.6-v2 (has Python 3.10)
+    #   - bitnami/spark:3.5.3-debian-12-r0 (has Python 3.11)
+    #   - Custom image with Python pre-installed
+    spark.kubernetes.container.image: "public.ecr.aws/dataminded/spark-k8s-glue:v3.5.3-hadoop-3.3.6-v2"
+    spark.kubernetes.container.image.pullPolicy: "IfNotPresent"
+    spark.kubernetes.namespace: "production-spark"
+    spark.kubernetes.authenticate.driver.serviceAccountName: "spark"
+    
+    # Python configuration - dataminded image has Python at /usr/bin/python3
+    spark.pyspark.python: "/usr/bin/python3"
+    spark.pyspark.driver.python: "/usr/bin/python3"
+    
+    # IAM Role
+    spark.kubernetes.driver.annotation.iam.amazonaws.com/role: "arn:aws:iam::986748113845:role/flink_scalamigo_access-production"
+    
+    # S3 access for pyFiles (dataminded image has hadoop-aws)
+    spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    spark.hadoop.fs.s3a.aws.credentials.provider: "com.amazonaws.auth.InstanceProfileCredentialsProvider"
+    
+    # Dynamic allocation off for simple test
+    spark.dynamicAllocation.enabled: "false"
+    spark.executor.instances: "1"
+    
+    # Keep driver for debugging
+    spark.kubernetes.driver.deleteOnTermination: "false"
+

@@ -1,0 +1,29 @@
+# Tubi Production Values - Minimal Overrides Only
+# Only overrides what differs from defaults
+
+# Keep same resources (16 CPU, 64Gi memory)
+operatorDeployment:
+  operatorPod:
+    operatorContainer:
+      resources:
+        limits:
+          cpu: "16"
+          ephemeral-storage: 2Gi
+          memory: 64Gi
+        requests:
+          cpu: "16"
+          ephemeral-storage: 2Gi
+          memory: 64Gi
+
+# Configure watched namespaces
+workloadResources:
+  namespaces:
+    create: false  # Namespaces already exist
+    overrideWatchedNamespaces: true
+    data:
+      - "production-spark"
+      - "default"
+  # IAM role for S3 access
+  annotations:
+    "helm.sh/resource-policy": keep
+    "eks.amazonaws.com/role-arn": "arn:aws:iam::986748113845:role/flink_scalamigo_access-production"

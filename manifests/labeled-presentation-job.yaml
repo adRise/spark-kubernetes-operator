@@ -1,0 +1,163 @@
+# =============================================================================
+# Labeled Presentation ETL Job - Batch Configuration
+# =============================================================================
+# Batch job for labeled homepage presentation data processing
+#
+# Usage:
+#   kubectl apply -f labeled-presentation-job.yaml -n production-spark
+#   kubectl get sparkapp labeled-presentation -n production-spark -w
+#   kubectl logs -f labeled-presentation-0-driver -n production-spark
+# =============================================================================
+
+apiVersion: spark.apache.org/v1
+kind: SparkApplication
+metadata:
+  name: labeled-presentation
+  labels:
+    app: labeled-presentation
+    environment: production
+    team: ml
+spec:
+  # ---------------------------------------------------------------------------
+  # Application Entry Point
+  # ---------------------------------------------------------------------------
+  mainClass: "com.tubitv.ml.data.etl.LabeledPresentation"
+  jars: "s3a://tubi-scalamigo-artifacts/adRise/spark/2025-12-10T0331-master-1cf61af163/TubiSparkJobs-assembly-1.3.264.jar"
+  driverArgs:
+    - "--steps"
+    - "labeled_homepage_presentation"
+    - "--target-date"
+    - "2025-12-06"
+  
+  runtimeVersions:
+    sparkVersion: "3.5.3"
+    scalaVersion: "2.12"
+
+  # ---------------------------------------------------------------------------
+  # Batch Job Lifecycle - DEBUG MODE: Keep pods for log inspection
+  # ---------------------------------------------------------------------------
+  applicationTolerations:
+    resourceRetainPolicy: Always      # Keep pods on success or failure for debugging
+    resourceRetainDurationMillis: 7200000  # Keep for 2 hours
+    restartConfig:
+      restartPolicy: Never            # Don't restart - let us inspect the failure
+      maxRestartAttempts: 0
+
+  # ---------------------------------------------------------------------------
+  # Driver Pod Template
+  # ---------------------------------------------------------------------------
+  driverSpec:
+    podTemplateSpec:
+      metadata:
+        labels:
+          app: labeled-presentation
+          component: driver
+          environment: production
+      spec:
+        serviceAccountName: spark
+        securityContext:
+          runAsUser: 185
+          runAsNonRoot: true
+          fsGroup: 185
+        containers:
+          - name: spark-kubernetes-driver
+            resources:
+              requests:
+                cpu: "4"
+                memory: 16Gi
+              limits:
+                cpu: "4"
+                memory: 16Gi
+
+  # ---------------------------------------------------------------------------
+  # Executor Pod Template
+  # ---------------------------------------------------------------------------
+  executorSpec:
+    podTemplateSpec:
+      metadata:
+        labels:
+          app: labeled-presentation
+          component: executor
+      spec:
+        serviceAccountName: spark
+        securityContext:
+          runAsUser: 185
+          runAsNonRoot: true
+          fsGroup: 185
+
+  # ---------------------------------------------------------------------------
+  # Spark Configuration
+  # ---------------------------------------------------------------------------
+  sparkConf:
+    # Container & Kubernetes - image with hadoop-aws pre-installed (for Scala 2.12 apps)
+    spark.kubernetes.container.image: "public.ecr.aws/dataminded/spark-k8s-glue:v3.5.3-hadoop-3.3.6-v2"
+    spark.kubernetes.container.image.pullPolicy: "IfNotPresent"
+    spark.kubernetes.namespace: "production-spark"
+    spark.kubernetes.authenticate.driver.serviceAccountName: "spark"
+    
+    # IAM Role for AWS Access
+    spark.kubernetes.driver.annotation.iam.amazonaws.com/role: "arn:aws:iam::986748113845:role/flink_scalamigo_access-production"
+    spark.kubernetes.executor.annotation.iam.amazonaws.com/role: "arn:aws:iam::986748113845:role/flink_scalamigo_access-production"
+    
+    # S3 FileSystem Configuration - map s3:// to s3a:// implementation
+    spark.hadoop.fs.s3.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    spark.hadoop.fs.s3n.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    spark.hadoop.fs.s3a.fast.upload: "true"
+    # Use EC2 metadata service for kiam credentials
+    spark.hadoop.fs.s3a.aws.credentials.provider: "com.amazonaws.auth.InstanceProfileCredentialsProvider"
+    
+    # Pod Labels
+    spark.kubernetes.driver.label.app: "labeled-presentation"
+    spark.kubernetes.driver.label.environment: "production"
+    spark.kubernetes.executor.label.app: "labeled-presentation"
+    spark.kubernetes.executor.label.environment: "production"
+    
+    # Environment Variables
+    spark.kubernetes.driverEnv.TUBI_ENVIRONMENT: "production"
+    spark.kubernetes.driverEnv.TUBI_S3_ENVIRONMENT: "production"
+
+    # Resources
+    spark.driver.cores: "4"
+    spark.driver.memory: "12g"
+    spark.driver.memoryOverhead: "4g"
+    spark.executor.cores: "4"
+    spark.executor.memory: "12g"
+    spark.executor.memoryOverhead: "4g"
+
+    # Dynamic Allocation
+    spark.dynamicAllocation.enabled: "true"
+    spark.dynamicAllocation.shuffleTracking.enabled: "true"
+    spark.dynamicAllocation.minExecutors: "2"
+    spark.dynamicAllocation.initialExecutors: "4"
+    spark.dynamicAllocation.maxExecutors: "20"
+
+    # Use local disk (emptyDir) instead of PVC - simpler
+    spark.local.dir: "/tmp/spark-local"
+
+    # External Dependencies - JARs from S3 (image has hadoop-aws pre-installed)
+    spark.jars.ivy: "/tmp/ivy"
+    # Note: Maven repos are blocked, so we load JARs from S3 instead
+    spark.jars: "s3a://tubi-scalamigo-artifacts/adRise/sparky/datalocation-delta-3-3/master/datalocation-delta-3-3_2.12-assembly-0.0.48.jar"
+    
+    # Ensure executors get the JARs
+    spark.kubernetes.executor.podNamePrefix: "labeled-presentation"
+    spark.files.fetchFailure.unRegisterOutputOnHost: "true"
+
+    # Delta Lake Configuration (Unity Catalog removed - Maven blocked)
+    spark.sql.extensions: "io.delta.sql.DeltaSparkSessionExtension"
+    spark.sql.catalog.spark_catalog: "org.apache.spark.sql.delta.catalog.DeltaCatalog"
+
+    # SQL & Adaptive Query
+    spark.sql.adaptive.enabled: "true"
+    spark.sql.adaptive.coalescePartitions.enabled: "true"
+    spark.sql.shuffle.partitions: "400"
+
+    # Network
+    spark.network.timeout: "600s"
+    
+    # Disable event logging temporarily to avoid S3 init issues on executors
+    spark.eventLog.enabled: "false"
+    
+    # DEBUG: Keep driver pod after termination for log inspection
+    spark.kubernetes.driver.deleteOnTermination: "false"

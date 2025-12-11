@@ -1,0 +1,168 @@
+# =============================================================================
+# PySpark TensorFlow + Deepverse Wheel Test
+# =============================================================================
+# Tests installing:
+# - tensorflow==2.14.1
+# - tensorflow-recommenders==0.7.2
+# - tensorflow_datasets==4.9.8
+# - tensorflow-ranking==0.5.0
+# - deepverse wheel from S3
+#
+# Usage:
+#   kubectl apply -f pyspark-tensorflow-test.yaml -n production-spark
+#   kubectl logs -f pyspark-tf-test-0-driver -n production-spark
+# =============================================================================
+
+apiVersion: spark.apache.org/v1
+kind: SparkApplication
+metadata:
+  name: pyspark-tf-test
+  labels:
+    app: pyspark-tf-test
+    type: validation
+spec:
+  # ---------------------------------------------------------------------------
+  # PySpark Entry Point
+  # ---------------------------------------------------------------------------
+  # Simple test script that imports the packages
+  pyFiles: "s3a://tubi-scalamigo-artifacts/adRise/spark/wrapper.py"
+  driverArgs: []
+  
+  runtimeVersions:
+    sparkVersion: "3.5.3"
+    scalaVersion: "2.12"
+
+  applicationTolerations:
+    resourceRetainPolicy: Always
+    resourceRetainDurationMillis: 7200000  # 2 hours for debugging
+    restartConfig:
+      restartPolicy: Never
+
+  # ---------------------------------------------------------------------------
+  # Driver Pod Template with Init Container for pip install
+  # ---------------------------------------------------------------------------
+  driverSpec:
+    podTemplateSpec:
+      spec:
+        serviceAccountName: spark
+        
+        # Init container to install pip packages
+        initContainers:
+          - name: pip-installer
+            image: "public.ecr.aws/dataminded/spark-k8s-glue:v3.5.3-hadoop-3.3.6-v2"
+            command:
+              - /bin/bash
+              - -c
+              - |
+                set -ex
+                echo "=== Starting pip install ==="
+                
+                # Install to shared volume
+                pip install --target=/opt/spark-deps --no-cache-dir \
+                  tensorflow==2.14.1 \
+                  tensorflow-recommenders==0.7.2 \
+                  tensorflow_datasets==4.9.8 \
+                  tensorflow-ranking==0.5.0
+                
+                echo "=== TensorFlow packages installed ==="
+                
+                # Install boto3 first for S3 access
+                pip install --target=/opt/spark-deps --no-cache-dir boto3
+                
+                echo "=== Downloading deepverse wheel from S3 using boto3 ==="
+                
+                # Download wheel from S3 using boto3 inline
+                PYTHONPATH=/opt/spark-deps python3 -c "import boto3,os,sys;s3=boto3.client('s3',region_name='us-west-2');s3.download_file('tubi-scalamigo-artifacts','adRise/deepverse/dist-production-09762697/deepverse-2025.1210.92106-py3-none-any.whl','/tmp/deepverse-2025.1210.92106-py3-none-any.whl');print('Downloaded, size',os.path.getsize('/tmp/deepverse-2025.1210.92106-py3-none-any.whl'))" || echo "Deepverse download failed"
+                
+                # If wheel exists, install it
+                if [ -f /tmp/deepverse-2025.1210.92106-py3-none-any.whl ]; then
+                  pip install --target=/opt/spark-deps --no-cache-dir /tmp/deepverse-2025.1210.92106-py3-none-any.whl
+                  echo "Deepverse installed successfully"
+                else
+                  echo "Deepverse wheel not found, skipping"
+                fi
+                
+                echo "=== Listing installed packages ==="
+                ls -la /opt/spark-deps/ | head -30
+                
+                # Verify TensorFlow import
+                echo "=== Verifying TensorFlow import ==="
+                PYTHONPATH=/opt/spark-deps python3 -c "import tensorflow as tf; print(f'TensorFlow version: {tf.__version__}')" || echo "TensorFlow import failed"
+                
+                echo "=== Init container complete ==="
+            
+            volumeMounts:
+              - name: spark-deps
+                mountPath: /opt/spark-deps
+            
+            resources:
+              requests:
+                cpu: "2"
+                memory: 8Gi
+              limits:
+                cpu: "4"
+                memory: 16Gi
+            
+            env:
+              # AWS credentials will be provided by kiam via instance metadata
+              - name: AWS_DEFAULT_REGION
+                value: "us-west-2"
+        
+        containers:
+          - name: spark-kubernetes-driver
+            resources:
+              requests:
+                cpu: "4"
+                memory: 16Gi
+              limits:
+                cpu: "8"
+                memory: 32Gi
+            env:
+              # Add installed packages to PYTHONPATH
+              - name: PYTHONPATH
+                value: "/opt/spark-deps:/opt/spark/python:/opt/spark/python/lib/pyspark.zip:/opt/spark/python/lib/py4j-0.10.9.7-src.zip"
+            volumeMounts:
+              - name: spark-deps
+                mountPath: /opt/spark-deps
+        
+        volumes:
+          - name: spark-deps
+            emptyDir:
+              sizeLimit: 10Gi
+
+  # ---------------------------------------------------------------------------
+  # Spark Configuration
+  # ---------------------------------------------------------------------------
+  sparkConf:
+    spark.kubernetes.container.image: "public.ecr.aws/dataminded/spark-k8s-glue:v3.5.3-hadoop-3.3.6-v2"
+    spark.kubernetes.container.image.pullPolicy: "IfNotPresent"
+    spark.kubernetes.namespace: "production-spark"
+    spark.kubernetes.authenticate.driver.serviceAccountName: "spark"
+    
+    # IAM Role for S3 access (kiam)
+    spark.kubernetes.driver.annotation.iam.amazonaws.com/role: "arn:aws:iam::986748113845:role/flink_scalamigo_access-production"
+    spark.kubernetes.executor.annotation.iam.amazonaws.com/role: "arn:aws:iam::986748113845:role/flink_scalamigo_access-production"
+    
+    # S3 access
+    spark.hadoop.fs.s3.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    spark.hadoop.fs.s3a.aws.credentials.provider: "com.amazonaws.auth.InstanceProfileCredentialsProvider"
+    
+    # Python configuration
+    spark.pyspark.python: "/usr/bin/python3"
+    spark.pyspark.driver.python: "/usr/bin/python3"
+    
+    # Add the deps directory to Python path
+    spark.executorEnv.PYTHONPATH: "/opt/spark-deps:/opt/spark/python:/opt/spark/python/lib/pyspark.zip"
+    spark.kubernetes.driverEnv.PYTHONPATH: "/opt/spark-deps:/opt/spark/python:/opt/spark/python/lib/pyspark.zip"
+    
+    # Resources
+    spark.driver.memory: "24g"
+    spark.driver.cores: "4"
+    spark.executor.memory: "8g"
+    spark.executor.cores: "2"
+    
+    spark.dynamicAllocation.enabled: "false"
+    spark.executor.instances: "1"
+    spark.kubernetes.driver.deleteOnTermination: "false"
+

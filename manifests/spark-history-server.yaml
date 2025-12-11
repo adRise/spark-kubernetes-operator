@@ -1,0 +1,135 @@
+# =============================================================================
+# Spark History Server - Production Configuration
+# =============================================================================
+# This SparkApplication runs a Spark History Server that serves completed
+# Spark application logs from S3. It provides a web UI for viewing past
+# job executions, stages, tasks, and metrics.
+#
+# Features:
+# - Reads event logs from S3
+# - Auto-cleans logs older than 90 days
+# - Keeps up to 500 applications
+# - Updates every 30 seconds
+# - Auto-restart on failure
+#
+# Usage:
+#   kubectl apply -f spark-history-server.yaml -n production-spark
+#
+# Access UI:
+#   kubectl port-forward spark-history-server-<id>-driver 18080:18080 -n production-spark
+#   Then open: http://localhost:18080
+# =============================================================================
+
+apiVersion: spark.apache.org/v1
+kind: SparkApplication
+metadata:
+  name: spark-history-server
+  labels:
+    app: spark-history
+    environment: production
+spec:
+  # ---------------------------------------------------------------------------
+  # Application Entry Point
+  # ---------------------------------------------------------------------------
+  mainClass: org.apache.spark.deploy.history.HistoryServer
+  
+  runtimeVersions:
+    sparkVersion: "4.0.1"
+
+  # ---------------------------------------------------------------------------
+  # Application Lifecycle Management
+  # ---------------------------------------------------------------------------
+  applicationTolerations:
+    # Don't retain resources (lightweight service)
+    resourceRetainPolicy: Never
+    
+    # Auto-restart configuration for long-running service
+    restartConfig:
+      restartPolicy: Always
+      maxRestartAttempts: 9223372036854775807  # Max long value (infinite)
+      restartBackoffMillis: 30000              # Wait 30s between restarts
+
+  # ---------------------------------------------------------------------------
+  # Driver Pod Template
+  # ---------------------------------------------------------------------------
+  driverSpec:
+    podTemplateSpec:
+      metadata:
+        labels:
+          app: spark-history
+          component: server
+          environment: production
+        annotations:
+          iam.amazonaws.com/role: "arn:aws:iam::986748113845:role/flink_scalamigo_access-production"
+      spec:
+        serviceAccountName: spark
+        containers:
+          - name: spark-kubernetes-driver
+            resources:
+              requests:
+                cpu: "2"
+                memory: 5Gi
+              limits:
+                cpu: "2"
+                memory: 5Gi
+
+  # ---------------------------------------------------------------------------
+  # Spark Configuration
+  # ---------------------------------------------------------------------------
+  sparkConf:
+    # =========================================================================
+    # Container & Kubernetes Settings
+    # =========================================================================
+    spark.kubernetes.container.image: "apache/spark:4.0.1"
+    spark.kubernetes.container.image.pullPolicy: "IfNotPresent"
+    spark.kubernetes.namespace: "production-spark"
+    spark.kubernetes.authenticate.driver.serviceAccountName: "spark"
+    
+    # IAM Role for AWS Access
+    spark.kubernetes.driver.annotation.iam.amazonaws.com/role: "arn:aws:iam::986748113845:role/flink_scalamigo_access-production"
+    
+    # Pod Labels
+    spark.kubernetes.driver.label.app: "spark-history"
+    spark.kubernetes.driver.label.component: "server"
+    spark.kubernetes.driver.label.environment: "production"
+
+    # =========================================================================
+    # Driver Resources
+    # =========================================================================
+    spark.driver.cores: "2"
+    spark.driver.memory: "4g"
+    spark.driver.memoryOverhead: "1g"
+
+    # =========================================================================
+    # S3 / Hadoop Configuration
+    # =========================================================================
+    spark.hadoop.fs.defaultFS: "s3a://tubi-scalamigo-datalake-production"
+    spark.hadoop.fs.s3.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    spark.hadoop.fs.s3a.fast.upload: "true"
+
+    # =========================================================================
+    # History Server Configuration
+    # =========================================================================
+    # Log directory (where Spark jobs write event logs)
+    spark.history.fs.logDirectory: "s3a://tubi-scalamigo-datalake-production/spark-history/"
+    
+    # Update interval
+    spark.history.fs.update.interval: "30s"
+    
+    # Cleaner configuration
+    spark.history.fs.cleaner.enabled: "true"
+    spark.history.fs.cleaner.interval: "1d"       # Check daily
+    spark.history.fs.cleaner.maxAge: "90d"        # Keep logs for 90 days
+    spark.history.fs.cleaner.maxNum: "500"        # Keep max 500 applications
+    spark.history.fs.eventLog.rolling.maxFilesToRetain: "20"
+    
+    # UI port
+    spark.ui.port: "18080"
+
+    # =========================================================================
+    # External Dependencies
+    # =========================================================================
+    spark.jars.ivy: "/tmp/ivy"
+    spark.jars.packages: "org.apache.hadoop:hadoop-aws:3.4.0,com.amazonaws:aws-java-sdk-bundle:1.12.367"
+
