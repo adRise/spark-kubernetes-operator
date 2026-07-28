@@ -22,6 +22,13 @@ jobs:
         # keep in sync with default value of workflow_dispatch input 'branch'
         branch: ${{ fromJSON( inputs.branch || '["main"]' ) }}
     steps:
+    - name: Harden the runner
+      uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+      with:
+        use-policy-store: true
+        egress-policy: audit
+        api-key: ${{ secrets.STEP_SECURITY_API_KEY }}
+
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v3
     - name: Set up Docker Buildx
